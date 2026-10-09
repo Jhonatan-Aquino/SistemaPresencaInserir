@@ -569,20 +569,21 @@
 
     // Processa o CSV
     const processCSV = (csvText) => {
-        const lines = csvText.split('\n');
+        // Remove BOM e normaliza quebras de linha (CRLF deixava "\r" colado na última coluna)
+        const lines = csvText.replace(/^\uFEFF/, '').split(/\r\n|\n|\r/);
         const data = [];
         const alunosComProblemas = [];
 
         for (let i = 0; i < lines.length; i++) {
             if (lines[i].trim() === '') continue;
 
-            const values = lines[i].split(';');
+            const values = lines[i].split(';').map(v => (v || '').replace(/[\u200B\uFEFF]/g, '').replace('%', '').trim());
             const entry = {
                 nome: values[0],
-                frequenciaMesUm: values[1],
-                justificativaMesUm: values[2],
-                frequenciaMesDois: values[3],
-                justificativaMesDois: values[4]
+                frequenciaMesUm: values[1] || '',
+                justificativaMesUm: values[2] || '',
+                frequenciaMesDois: values[3] || '',
+                justificativaMesDois: values[4] || ''
             };
 
             // Valida os dados do aluno
@@ -650,33 +651,94 @@
         });
     };
 
+    const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+    // Espera uma condição ficar verdadeira (polling), retorna o resultado ou null no timeout
+    const waitUntil = async (fn, timeout = 8000, interval = 100) => {
+        const start = Date.now();
+        while (Date.now() - start < timeout) {
+            const result = fn();
+            if (result) return result;
+            await sleep(interval);
+        }
+        return null;
+    };
+
+    // Seta o valor pelo setter nativo (o Angular/zone.js enxerga como digitação real)
+    const setNativeValue = (el, value) => {
+        const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value').set;
+        setter.call(el, value);
+    };
+
     // Função para simular digitação humana em um campo
     const simulateHumanInput = async (inputElement, value) => {
-        // Foca no campo
+        value = String(value ?? '');
         inputElement.focus();
+        inputElement.dispatchEvent(new Event('focus', { bubbles: false }));
+        await sleep(50);
 
-        // Limpa o valor atual
-        inputElement.value = '';
+        // Limpa e digita caractere a caractere
+        setNativeValue(inputElement, '');
         inputElement.dispatchEvent(new Event('input', { bubbles: true }));
 
-        // Define o novo valor
-        inputElement.value = value;
+        let atual = '';
+        for (const ch of value) {
+            const keyInit = { key: ch, bubbles: true, cancelable: true };
+            inputElement.dispatchEvent(new KeyboardEvent('keydown', keyInit));
+            atual += ch;
+            setNativeValue(inputElement, atual);
+            inputElement.dispatchEvent(new InputEvent('input', { bubbles: true, data: ch, inputType: 'insertText' }));
+            inputElement.dispatchEvent(new KeyboardEvent('keyup', keyInit));
+            await sleep(30);
+        }
 
-        // Dispara os eventos necessários para o Angular detectar a mudança
-        const inputEvent = new Event('input', { bubbles: true });
-        const changeEvent = new Event('change', { bubbles: true });
-
-        inputElement.dispatchEvent(inputEvent);
-        inputElement.dispatchEvent(changeEvent);
-
-        // Aguarda um momento para o Angular processar
-        await new Promise(resolve => setTimeout(resolve, 100));
-
-        // Remove o foco
+        inputElement.dispatchEvent(new Event('change', { bubbles: true }));
+        await sleep(150);
         inputElement.blur();
+        inputElement.dispatchEvent(new Event('blur', { bubbles: false }));
+        await sleep(200);
 
-        // Aguarda mais um momento após remover o foco
-        await new Promise(resolve => setTimeout(resolve, 100));
+        return inputElement.value === value;
+    };
+
+    // Texto normalizado para comparar nomes
+    const normalizar = (t) => (t || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/\s+/g, ' ').trim().toUpperCase();
+
+    // Localiza o botão Salvar do modal pelo texto
+    const getSaveButton = (modal) =>
+        Array.from(modal.querySelectorAll('button')).find(b => b.textContent.trim().toUpperCase() === 'SALVAR');
+
+    // Coleta mensagens de erro de validação visíveis no modal
+    const getModalErrors = (modal) => {
+        const erros = [];
+        modal.querySelectorAll('mat-form-field.mat-form-field-invalid').forEach(ff => {
+            const campo = ff.querySelector('input')?.getAttribute('formcontrolname') || 'campo';
+            const msg = ff.querySelector('mat-error')?.textContent?.trim() || 'inválido';
+            erros.push(`${campo}: ${msg}`);
+        });
+        return erros;
+    };
+
+    // Força o Angular a revalidar: reaplica frequências e passa foco pelos campos de motivo
+    const forcarRevalidacao = async (modal, aluno) => {
+        const q = (n) => modal.querySelector(`input[formcontrolname="${n}"]`);
+        const pares = [
+            ['frequenciaMesUm', aluno.frequenciaMesUm],
+            ['frequenciaMesDois', aluno.frequenciaMesDois]
+        ];
+        for (const [nome, valor] of pares) {
+            const el = q(nome);
+            if (el && valor !== '') await simulateHumanInput(el, valor);
+        }
+        for (const nome of ['codigoMotivoUm', 'codigoMotivoDois']) {
+            const el = q(nome);
+            if (el) {
+                el.focus();
+                await sleep(80);
+                el.blur();
+                await sleep(80);
+            }
+        }
     };
 
     // Função para encontrar o modal mais recente
@@ -715,31 +777,25 @@
 
     // Função para verificar o alerta de resposta
     const verificarAlertaResposta = async () => {
-        // Aguarda o diálogo aparecer
-        await new Promise(resolve => setTimeout(resolve, 1000));
-
-        // Procura o diálogo de alerta
-        const alertDialog = document.querySelector('app-dialog-alert');
+        // Aguarda o diálogo aparecer (a plataforma pode demorar)
+        const alertDialog = await waitUntil(() => document.querySelector('app-dialog-alert'), 15000, 200);
         if (!alertDialog) {
             throw new Error('Diálogo de resposta não encontrado');
         }
 
-        // Pega o conteúdo do alerta
         const titulo = alertDialog.querySelector('.mat-dialog-title')?.textContent?.trim() || '';
         const conteudo = alertDialog.querySelector('.mat-dialog-content')?.textContent?.trim() || '';
         const mensagemCompleta = `${titulo} - ${conteudo}`;
 
-        // Verifica se contém a palavra "sucesso" (case insensitive)
         if (!mensagemCompleta.toLowerCase().includes('sucesso')) {
             throw new Error(`Erro na operação: ${mensagemCompleta}`);
         }
 
-        // Se chegou aqui, é sucesso. Clica no OK
         const okButton = alertDialog.querySelector('.mat-dialog-actions button.btn-cadastrar');
         if (okButton) {
             okButton.click();
-            // Aguarda o diálogo fechar
-            await new Promise(resolve => setTimeout(resolve, 500));
+            await waitUntil(() => !document.querySelector('app-dialog-alert'), 5000, 100);
+            await sleep(300);
         }
     };
 
@@ -809,6 +865,15 @@
         statusDiv.scrollTop = 0;
     };
 
+    // Fecha o modal de frequência (usado quando a inserção falha)
+    const fecharModal = async (modal) => {
+        const closeButton = Array.from(modal.querySelectorAll('button')).find(b => b.textContent.includes('Fechar'));
+        if (closeButton) {
+            closeButton.click();
+            await waitForLoadingComplete();
+        }
+    };
+
     // Função para inserir dados do aluno
     const inserirDadosAluno = async (aluno) => {
         const { searchInput, searchButton } = findElements();
@@ -818,9 +883,8 @@
         }
 
         try {
-            // Preenche o campo de busca
-            searchInput.value = aluno.nome;
-            searchInput.dispatchEvent(new Event('input', { bubbles: true }));
+            // Preenche o campo de busca como se fosse digitado
+            await simulateHumanInput(searchInput, aluno.nome);
 
             // Clica no botão de busca
             searchButton.click();
@@ -835,93 +899,78 @@
             }
 
             // Aguarda a tabela carregar
-            const resultsTable = await waitForElement('table.mat-table');
+            await waitForElement('table.mat-table tbody tr');
 
-            // Aguarda a primeira linha da tabela
-            const firstRow = await waitForElement('table.mat-table tbody tr');
-
-            // Encontra o botão de edição na primeira linha
-            const editButton = firstRow.querySelector('span.nome-clicavel');
-            if (!editButton) {
-                throw new Error('Botão de edição não encontrado');
+            // Localiza a linha cujo nome bate exatamente com o aluno do CSV
+            const alvo = normalizar(aluno.nome);
+            const nomeSpan = await waitUntil(() => {
+                const spans = Array.from(document.querySelectorAll('table.mat-table tbody tr span.nome-clicavel'));
+                return spans.find(sp => normalizar(sp.textContent) === alvo);
+            }, 5000, 200);
+            if (!nomeSpan) {
+                throw new Error('Aluno não localizado na tabela de resultados (nome diferente do CSV)');
             }
 
-            // Clica no botão de edição
-            editButton.click();
+            nomeSpan.click();
 
-            // Aguarda um tempo para o modal começar a abrir
-            await new Promise(resolve => setTimeout(resolve, 500));
-
-            // Aguarda o modal abrir e pega o mais recente
-            let modal = null;
-            let attempts = 0;
-            const maxAttempts = 10;
-
-            while (!modal && attempts < maxAttempts) {
-                modal = findLatestModal();
-                if (!modal) {
-                    await new Promise(resolve => setTimeout(resolve, 500));
-                    attempts++;
-                }
-            }
+            // Aguarda o modal com o formulário do aluno correto
+            const modal = await waitUntil(() => {
+                const m = findLatestModal();
+                if (!m) return null;
+                const form = m.querySelector('form');
+                const freq = m.querySelector('input[formcontrolname="frequenciaMesUm"]');
+                if (!form || !freq) return null;
+                const dentro = normalizar(form.textContent);
+                return dentro.includes(alvo) ? m : null;
+            }, 15000, 250);
 
             if (!modal) {
-                throw new Error('Modal não encontrado após várias tentativas');
+                throw new Error('Modal do aluno não abriu / não corresponde ao aluno');
             }
 
-            // Aguarda o carregamento completo do modal
             await waitForLoadingComplete();
+            await sleep(500);
 
-            // Aguarda um tempo para o formulário processar
-            await new Promise(resolve => setTimeout(resolve, 2000));
+            const q = (n) => modal.querySelector(`input[formcontrolname="${n}"]`);
+            const frequenciaMesUmInput = q('frequenciaMesUm');
+            const frequenciaMesDoisInput = q('frequenciaMesDois');
+            const codigoMotivoUmInput = q('codigoMotivoUm');
+            const codigoMotivoDoisInput = q('codigoMotivoDois');
 
-            // Preenche os campos de frequência
-            const frequenciaMesUmInput = modal.querySelector('input[formcontrolname="frequenciaMesUm"]');
-            const frequenciaMesDoisInput = modal.querySelector('input[formcontrolname="frequenciaMesDois"]');
-            const codigoMotivoUmInput = modal.querySelector('input[formcontrolname="codigoMotivoUm"]');
-            const codigoMotivoDoisInput = modal.querySelector('input[formcontrolname="codigoMotivoDois"]');
-
-            // Preenche frequência do mês um
-            if (frequenciaMesUmInput) {
+            // Preenche frequências primeiro e motivos depois, para a validação condicional já enxergar a frequência
+            if (frequenciaMesUmInput && aluno.frequenciaMesUm !== '') {
                 await simulateHumanInput(frequenciaMesUmInput, aluno.frequenciaMesUm);
             }
-
-            // Se houver código de motivo, preenche
+            if (frequenciaMesDoisInput && aluno.frequenciaMesDois !== '') {
+                await simulateHumanInput(frequenciaMesDoisInput, aluno.frequenciaMesDois);
+            }
             if (aluno.justificativaMesUm && codigoMotivoUmInput) {
                 await simulateHumanInput(codigoMotivoUmInput, aluno.justificativaMesUm);
             }
-
-            // Preenche frequência do mês dois
-            if (frequenciaMesDoisInput) {
-                await simulateHumanInput(frequenciaMesDoisInput, aluno.frequenciaMesDois);
-            }
-
-            // Se houver código de motivo, preenche
             if (aluno.justificativaMesDois && codigoMotivoDoisInput) {
                 await simulateHumanInput(codigoMotivoDoisInput, aluno.justificativaMesDois);
             }
 
-            // Aguarda um tempo para o formulário processar
-            await new Promise(resolve => setTimeout(resolve, 1000));
+            // Espera o botão Salvar habilitar; se não habilitar, força revalidação e tenta de novo
+            let saveButton = getSaveButton(modal);
+            let habilitado = await waitUntil(() => (saveButton = getSaveButton(modal)) && !saveButton.disabled, 3000);
 
-            // Verifica se o botão de salvar está desabilitado
-            const saveButton = modal.querySelector('button.mat-raised-button.mat-primary.ng-star-inserted');
-            if (saveButton && saveButton.disabled) {
-                console.error(`Erro ao preencher dados para o aluno ${aluno.nome}: Dados inválidos`);
-                const buttons = Array.from(modal.querySelectorAll('button'));
-                const closeButton = buttons.find(b => b.textContent.includes('Fechar'));
-                if (closeButton) {
-                    closeButton.click();
-                    await waitForLoadingComplete();
-                }
-            } else if (saveButton && !saveButton.disabled) {
-                // Se o botão estiver habilitado, clica nele
-                saveButton.click();
-                await waitForLoadingComplete();
-
-                // Verifica a resposta do servidor
-                await verificarAlertaResposta();
+            for (let tentativa = 1; !habilitado && tentativa <= 3; tentativa++) {
+                await forcarRevalidacao(modal, aluno);
+                habilitado = await waitUntil(() => (saveButton = getSaveButton(modal)) && !saveButton.disabled, 3000);
             }
+
+            if (!habilitado) {
+                const erros = getModalErrors(modal);
+                await fecharModal(modal);
+                throw new Error(`Botão Salvar não habilitou${erros.length ? ' (' + erros.join('; ') + ')' : ''}`);
+            }
+
+            saveButton.click();
+            await waitForLoadingComplete();
+
+            // Verifica a resposta do servidor
+            await verificarAlertaResposta();
 
             return true;
         } catch (error) {
