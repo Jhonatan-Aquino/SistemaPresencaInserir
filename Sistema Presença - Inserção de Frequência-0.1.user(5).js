@@ -642,7 +642,7 @@
                 const loadingElements = document.querySelectorAll('.loading-foreground, .foreground-closing');
                 if (loadingElements.length === 0) {
                     // Aguarda mais 1 segundo para garantir que o carregamento realmente terminou
-                    setTimeout(resolve, 1000);
+                    setTimeout(resolve, 400);
                 } else {
                     setTimeout(checkLoading, 100);
                 }
@@ -775,37 +775,85 @@
         return modalsVisiveis.length > 0 ? modalsVisiveis[modalsVisiveis.length - 1] : null;
     };
 
-    // Função para verificar o alerta de resposta
-    const verificarAlertaResposta = async () => {
-        // Aguarda o diálogo aparecer (a plataforma pode demorar)
-        const alertDialog = await waitUntil(() => document.querySelector('app-dialog-alert'), 15000, 200);
-        if (!alertDialog) {
-            throw new Error('Diálogo de resposta não encontrado');
-        }
+    // Lê título/conteúdo de um app-dialog-alert
+    const lerAlerta = (dialog) => {
+        const titulo = dialog.querySelector('.mat-dialog-title')?.textContent?.trim() || '';
+        const conteudo = dialog.querySelector('.mat-dialog-content')?.textContent?.trim() || '';
+        return titulo || conteudo ? `${titulo} - ${conteudo}` : '';
+    };
 
-        const titulo = alertDialog.querySelector('.mat-dialog-title')?.textContent?.trim() || '';
-        const conteudo = alertDialog.querySelector('.mat-dialog-content')?.textContent?.trim() || '';
-        const mensagemCompleta = `${titulo} - ${conteudo}`;
+    // Arma um observador ANTES de salvar: captura a mensagem do alerta no instante em que ela
+    // aparece, mesmo que a plataforma a feche sozinha logo em seguida.
+    const armarObservadorAlerta = () => {
+        const jaExistentes = new Set(document.querySelectorAll('app-dialog-alert'));
+        let mensagem = null;
+        let notificar = () => {};
 
-        if (!mensagemCompleta.toLowerCase().includes('sucesso')) {
-            throw new Error(`Erro na operação: ${mensagemCompleta}`);
-        }
+        const checar = () => {
+            if (mensagem) return;
+            for (const dialog of document.querySelectorAll('app-dialog-alert')) {
+                if (jaExistentes.has(dialog)) continue;
+                const texto = lerAlerta(dialog);
+                if (texto) {
+                    mensagem = texto;
+                    // Sucesso: se a plataforma não fechar sozinha, fecha no OK (erros ficam abertos para leitura)
+                    if (texto.toLowerCase().includes('sucesso')) {
+                        dialog.querySelector('.mat-dialog-actions button.btn-cadastrar')?.click();
+                    }
+                    notificar();
+                    return;
+                }
+            }
+        };
 
-        const okButton = alertDialog.querySelector('.mat-dialog-actions button.btn-cadastrar');
-        if (okButton) {
-            okButton.click();
-            await waitUntil(() => !document.querySelector('app-dialog-alert'), 5000, 100);
-            await sleep(300);
+        const observer = new MutationObserver(checar);
+        observer.observe(document.body, { childList: true, subtree: true, characterData: true });
+
+        return {
+            obter: () => mensagem,
+            aguardar: (timeout) => new Promise(resolve => {
+                if (mensagem) return resolve(mensagem);
+                const timer = setTimeout(() => resolve(null), timeout);
+                notificar = () => { clearTimeout(timer); resolve(mensagem); };
+            }),
+            parar: () => observer.disconnect()
+        };
+    };
+
+    // Função para verificar o alerta de resposta (usa o observador armado antes do clique em Salvar)
+    const verificarAlertaResposta = async (watcher, modal) => {
+        try {
+            // Espera o alerta (resolve na hora em que ele aparece). Se o modal fechar sem alerta
+            // visível, dá uma curta tolerância antes de acusar falta de confirmação.
+            let mensagem = watcher.obter();
+            const inicio = Date.now();
+            let modalFechouEm = null;
+            while (!mensagem && Date.now() - inicio < 15000) {
+                mensagem = await watcher.aguardar(150);
+                if (!mensagem && !modal.isConnected) {
+                    modalFechouEm = modalFechouEm || Date.now();
+                    if (Date.now() - modalFechouEm > 2500) break;
+                }
+            }
+
+            if (!mensagem) {
+                throw new Error('Diálogo de resposta não encontrado');
+            }
+            if (!mensagem.toLowerCase().includes('sucesso')) {
+                throw new Error(`Erro na operação: ${mensagem}`);
+            }
+
+            // Garante que o diálogo (se ainda aberto) tenha fechado antes do próximo aluno
+            await waitUntil(() => !document.querySelector('app-dialog-alert'), 3000, 50);
+        } finally {
+            watcher.parar();
         }
     };
 
     // Função para verificar alerta de busca
     const verificarAlertaBusca = async () => {
-        // Aguarda o diálogo aparecer
-        await new Promise(resolve => setTimeout(resolve, 1000));
-
-        // Procura o diálogo de alerta
-        const alertDialog = document.querySelector('app-dialog-alert');
+        // Aguarda o diálogo aparecer (retorna assim que surgir; sem alerta, segue em ~700ms)
+        const alertDialog = await waitUntil(() => document.querySelector('app-dialog-alert'), 700, 50);
         if (!alertDialog) {
             return null; // Não há alerta
         }
@@ -966,11 +1014,13 @@
                 throw new Error(`Botão Salvar não habilitou${erros.length ? ' (' + erros.join('; ') + ')' : ''}`);
             }
 
+            // Arma o observador antes do clique para não perder um alerta que se fecha sozinho
+            const watcher = armarObservadorAlerta();
             saveButton.click();
-            await waitForLoadingComplete();
 
             // Verifica a resposta do servidor
-            await verificarAlertaResposta();
+            await verificarAlertaResposta(watcher, modal);
+            await waitForLoadingComplete();
 
             return true;
         } catch (error) {
@@ -1181,7 +1231,7 @@
                     }
 
                     if (!stopScript) {
-                        await new Promise(resolve => setTimeout(resolve, 2000));
+                        await new Promise(resolve => setTimeout(resolve, 500));
                     }
                 }
 
